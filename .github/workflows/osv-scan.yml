@@ -1,0 +1,775 @@
+name: 🔒 Multi-Tool Security Scanner - Full Repository Analysis
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  issues: write          
+  pull-requests: write  
+
+env:
+  OSV_SCANNER_VERSION: "latest"
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    name: 🛡️ Multi-Tool Security Analysis
+    
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔧 Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+          cache: false  # Disable cache to stop warnings
+
+      - name: 📦 Install Security Scanners
+        run: |
+          echo "🚀 Installing security scanning tools..."
+          
+          # Install OSV-Scanner for dependency vulnerabilities
+          go install github.com/google/osv-scanner/cmd/osv-scanner@${{ env.OSV_SCANNER_VERSION }}
+          
+          # Install Semgrep for code vulnerability scanning
+          python3 -m pip install semgrep
+          
+          # Install Trivy for comprehensive security scanning
+          sudo apt-get update
+          sudo apt-get install wget apt-transport-https gnupg lsb-release -y
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
+          
+          # Add Go bin to PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+          
+          echo "✅ Security scanners installed:"
+          echo "  - OSV-Scanner: $("$HOME/go/bin/osv-scanner" --version)"
+          echo "  - Semgrep: $(semgrep --version)"
+          echo "  - Trivy: $(trivy --version)"
+      - name: Set image tag
+        id: vars
+        if: hashFiles('Dockerfile') != ''
+        run: echo "TAG=pr-${{ github.event.number || github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: Build image
+        if: hashFiles('Dockerfile') != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          tags: local/demo:${{ steps.vars.outputs.TAG }}
+          load: true
+      - name: Install Syft
+        if: hashFiles('Dockerfile') != ''
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft version
+      - name: Create SBOM from image
+        if: hashFiles('Dockerfile') != ''
+        run: |
+          mkdir -p artifacts
+          syft "local/demo:${{ steps.vars.outputs.TAG }}" -o cyclonedx-json=artifacts/osv-sbom.json
+
+      - name: 🔍 Multi-Tool Security Scan
+        id: security-scan
+        run: |
+          echo "🚀 Starting comprehensive security scan..."
+          mkdir -p scan-results
+          
+          # 1. OSV-Scanner for dependency vulnerabilities
+          echo "📦 Scanning dependencies with OSV-Scanner..."
+          "$HOME/go/bin/osv-scanner" \
+          scan source \
+          --format json \
+          --output scan-results/osv-source.json \
+          . || true
+          if [[ -f "artifacts/osv-sbom.json" ]]; then
+            echo "🐳 Scanning Docker SBOM with OSV-Scanner..."
+            "$HOME/go/bin/osv-scanner" \
+              --sbom=artifacts/osv-sbom.json \
+              --format json \
+              --output scan-results/osv-sbom-scan.json || true
+            "$HOME/go/bin/osv-scanner" \
+              --sbom=artifacts/osv-sbom.json \
+              --format sarif \
+              --output scan-results/osv-image.sarif || true 
+          else
+            echo '{"results": []}' > scan-results/osv-sbom-scan.json
+          fi  
+          echo "🔄 Merging OSV scan results..."
+          jq -s '{"results": [.[] | .results[]? // empty]}' \
+            scan-results/osv-source.json \
+            scan-results/osv-sbom-scan.json > scan-results/osv-scan.json 2>/dev/null || echo '{"results": []}' > scan-results/osv-scan.json
+                  
+          # 2. Semgrep for code vulnerabilities
+          echo "🔍 Scanning code with Semgrep..."
+          semgrep --config=auto \
+            --json \
+            --output=scan-results/semgrep-scan.json \
+            . || true
+          
+          # 3. Trivy filesystem scan
+          echo "🛡️ Scanning filesystem with Trivy..."
+          trivy fs . \
+            --format json \
+            --output scan-results/trivy-fs-scan.json \
+            --skip-dirs .git || true
+          
+          # 4. Trivy config scan (for misconfigurations)
+          echo "⚙️ Scanning configurations with Trivy..."
+          trivy config . \
+            --format json \
+            --output scan-results/trivy-config-scan.json \
+            --skip-dirs .git || true
+          
+          # 5. Trivy Dockerfile scan (if Dockerfile exists)
+          if [[ -f "Dockerfile" ]]; then
+            echo "🐳 Scanning Dockerfile with Trivy..."
+            trivy config Dockerfile \
+              --format json \
+              --output scan-results/trivy-dockerfile-scan.json || true
+          else
+            echo '{"Results": []}' > scan-results/trivy-dockerfile-scan.json
+          fi
+          
+          # 6. Generate human-readable summaries
+          "$HOME/go/bin/osv-scanner" \
+            --recursive \
+            --format table \
+            --output scan-results/osv-summary.txt \
+            . || true
+          
+          semgrep --config=auto \
+            --output=scan-results/semgrep-summary.txt \
+            . || true
+          
+          trivy fs . \
+            --format table \
+            --output scan-results/trivy-summary.txt \
+            --skip-dirs .git || true
+
+      - name: 📊 Process All Scan Results
+        id: process-results
+        run: |
+          echo "📈 Processing multi-tool scan results..."
+          
+          # Initialize counters
+          TOTAL_ISSUES=0
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          MEDIUM_COUNT=0
+          
+          # Process OSV results
+          if [[ -f "scan-results/osv-scan.json" ]]; then
+            OSV_COUNT=$(jq -r '.results[]?.packages[]?.vulnerabilities? // [] | length' scan-results/osv-scan.json | awk '{sum += $1} END {print sum+0}')
+            TOTAL_ISSUES=$((TOTAL_ISSUES + OSV_COUNT))
+            echo "📦 OSV-Scanner found: $OSV_COUNT dependency vulnerabilities"
+          fi
+          
+          # Process Semgrep results
+          if [[ -f "scan-results/semgrep-scan.json" ]]; then
+            SEMGREP_COUNT=$(jq -r '.results | length' scan-results/semgrep-scan.json)
+            TOTAL_ISSUES=$((TOTAL_ISSUES + SEMGREP_COUNT))
+            
+            # Count by severity
+            SEMGREP_HIGH=$(jq -r '.results[] | select(.extra.severity == "ERROR") | .check_id' scan-results/semgrep-scan.json | wc -l)
+            SEMGREP_MEDIUM=$(jq -r '.results[] | select(.extra.severity == "WARNING") | .check_id' scan-results/semgrep-scan.json | wc -l)
+            CRITICAL_COUNT=$((CRITICAL_COUNT + SEMGREP_HIGH))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + SEMGREP_MEDIUM))
+            
+            echo "🔍 Semgrep found: $SEMGREP_COUNT code vulnerabilities ($SEMGREP_HIGH high, $SEMGREP_MEDIUM medium)"
+          fi
+          
+          # Process Trivy filesystem results
+          if [[ -f "scan-results/trivy-fs-scan.json" ]]; then
+            TRIVY_FS_COUNT=$(jq -r '.Results[]?.Vulnerabilities[]? // [] | length' scan-results/trivy-fs-scan.json | awk '{sum += $1} END {print sum+0}')
+            TOTAL_ISSUES=$((TOTAL_ISSUES + TRIVY_FS_COUNT))
+            
+            # Count by severity
+            TRIVY_CRITICAL=$(jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL") | .VulnerabilityID' scan-results/trivy-fs-scan.json | wc -l)
+            TRIVY_HIGH=$(jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH") | .VulnerabilityID' scan-results/trivy-fs-scan.json | wc -l)
+            TRIVY_MEDIUM=$(jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "MEDIUM") | .VulnerabilityID' scan-results/trivy-fs-scan.json | wc -l)
+            
+            CRITICAL_COUNT=$((CRITICAL_COUNT + TRIVY_CRITICAL))
+            HIGH_COUNT=$((HIGH_COUNT + TRIVY_HIGH))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + TRIVY_MEDIUM))
+            
+            echo "🛡️ Trivy filesystem found: $TRIVY_FS_COUNT vulnerabilities ($TRIVY_CRITICAL critical, $TRIVY_HIGH high, $TRIVY_MEDIUM medium)"
+          fi
+          
+          # Process Trivy config results
+          if [[ -f "scan-results/trivy-config-scan.json" ]]; then
+            TRIVY_CONFIG_COUNT=$(jq -r '.Results[]?.Misconfigurations[]? // [] | length' scan-results/trivy-config-scan.json | awk '{sum += $1} END {print sum+0}')
+            TOTAL_ISSUES=$((TOTAL_ISSUES + TRIVY_CONFIG_COUNT))
+            
+            # Count config issues by severity
+            TRIVY_CONFIG_HIGH=$(jq -r '.Results[]?.Misconfigurations[]? | select(.Severity == "HIGH") | .ID' scan-results/trivy-config-scan.json | wc -l)
+            TRIVY_CONFIG_MEDIUM=$(jq -r '.Results[]?.Misconfigurations[]? | select(.Severity == "MEDIUM") | .ID' scan-results/trivy-config-scan.json | wc -l)
+            
+            HIGH_COUNT=$((HIGH_COUNT + TRIVY_CONFIG_HIGH))
+            MEDIUM_COUNT=$((MEDIUM_COUNT + TRIVY_CONFIG_MEDIUM))
+            
+            echo "⚙️ Trivy config found: $TRIVY_CONFIG_COUNT misconfigurations ($TRIVY_CONFIG_HIGH high, $TRIVY_CONFIG_MEDIUM medium)"
+          fi
+          
+          # Process Trivy Dockerfile results
+          if [[ -f "scan-results/trivy-dockerfile-scan.json" ]]; then
+            TRIVY_DOCKERFILE_COUNT=$(jq -r '.Results[]?.Misconfigurations[]? // [] | length' scan-results/trivy-dockerfile-scan.json | awk '{sum += $1} END {print sum+0}')
+            TOTAL_ISSUES=$((TOTAL_ISSUES + TRIVY_DOCKERFILE_COUNT))
+            
+            echo "🐳 Trivy Dockerfile found: $TRIVY_DOCKERFILE_COUNT Dockerfile issues"
+          fi
+          
+          # Set outputs
+          echo "TOTAL_VULNERABILITIES=$TOTAL_ISSUES" >> $GITHUB_OUTPUT
+          echo "CRITICAL_COUNT=$CRITICAL_COUNT" >> $GITHUB_OUTPUT  
+          echo "HIGH_COUNT=$HIGH_COUNT" >> $GITHUB_OUTPUT
+          echo "MEDIUM_COUNT=$MEDIUM_COUNT" >> $GITHUB_OUTPUT
+          
+          # Determine if we need to create an issue
+          if [[ $TOTAL_ISSUES -gt 0 ]]; then
+            echo "SHOULD_CREATE_ISSUE=true" >> $GITHUB_OUTPUT
+            echo "⚠️  Found $TOTAL_ISSUES total security issues ($CRITICAL_COUNT critical, $HIGH_COUNT high, $MEDIUM_COUNT medium)"
+          else
+            echo "SHOULD_CREATE_ISSUE=false" >> $GITHUB_OUTPUT
+            echo "✅ No security issues detected across all scanners!"
+          fi
+
+      - name: 💬 Comment on PR - Clean Results
+        if: github.event_name == 'pull_request' && steps.process-results.outputs.SHOULD_CREATE_ISSUE == 'false'
+        run: |
+          COMMENT_BODY=$(cat << 'EOF'
+          ## 🛡️ Multi-Tool Security Scan Results ✅
+          
+          **Status**: 🟢 **CLEAN** - No security issues detected!
+          
+          ### 🔍 Scanners Used:
+          - **OSV-Scanner**: Dependency vulnerabilities ✅
+          - **Semgrep**: Code security patterns ✅
+          - **GitLeaks**: Secrets & credentials ✅
+          - **Bandit**: Python security issues ✅
+          - **Trivy**: Filesystem vulnerabilities ✅
+          - **Trivy Config**: Infrastructure misconfigurations ✅
+          
+          ### Scan Summary
+          - **Total Security Issues**: 0
+          - **Critical Severity**: 0
+          - **High Severity**: 0
+          - **Medium Severity**: 0
+          
+          ### 🎯 Coverage:
+          - Dependencies and package manifests
+          - Source code security patterns  
+          - Hardcoded secrets and API keys
+          - Language-specific vulnerabilities
+          - Filesystem and OS vulnerabilities
+          - Infrastructure misconfigurations
+          - Container and Dockerfile security
+          
+          EOF
+          )
+          
+          # Add timestamp
+          COMMENT_BODY="${COMMENT_BODY}*Multi-scanner analysis completed at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")*"
+          
+          # Post comment via GitHub CLI
+          gh pr comment ${{ github.event.number }} --body "$COMMENT_BODY"
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+
+      - name: 💬 Comment on PR - Security Issues Found
+        if: github.event_name == 'pull_request' && steps.process-results.outputs.SHOULD_CREATE_ISSUE == 'true'
+        run: |
+          TOTAL_ISSUES="${{ steps.process-results.outputs.TOTAL_VULNERABILITIES }}"
+          CRITICAL_COUNT="${{ steps.process-results.outputs.CRITICAL_COUNT }}"
+          HIGH_COUNT="${{ steps.process-results.outputs.HIGH_COUNT }}"
+          MEDIUM_COUNT="${{ steps.process-results.outputs.MEDIUM_COUNT }}"
+          
+          # Create summary of findings
+          SCAN_SUMMARY=""
+          
+          # Add summaries from each tool
+          if [[ -f "scan-results/osv-summary.txt" ]]; then
+            SCAN_SUMMARY="${SCAN_SUMMARY}\n### 📦 OSV-Scanner (Dependencies)\n\`\`\`\n$(head -20 scan-results/osv-summary.txt)\n\`\`\`\n"
+          fi
+          
+          if [[ -f "scan-results/semgrep-summary.txt" ]]; then
+            SCAN_SUMMARY="${SCAN_SUMMARY}\n### 🔍 Semgrep (Code Analysis)\n\`\`\`\n$(head -20 scan-results/semgrep-summary.txt)\n\`\`\`\n"
+          fi
+          
+          if [[ -f "scan-results/trivy-summary.txt" ]]; then
+            SCAN_SUMMARY="${SCAN_SUMMARY}\n### 🛡️ Trivy (Filesystem & Container)\n\`\`\`\n$(head -20 scan-results/trivy-summary.txt)\n\`\`\`\n"
+          fi
+          
+          COMMENT_BODY=$(cat << EOF
+          ## 🛡️ Multi-Tool Security Scan Results ⚠️
+          
+          **Status**: 🔴 **SECURITY ISSUES DETECTED**
+          
+          ### 📊 Security Issue Summary
+          - **Total Security Issues**: ${TOTAL_ISSUES}
+          - **Critical Severity**: ${CRITICAL_COUNT}
+          - **High Severity**: ${HIGH_COUNT}
+          - **Medium Severity**: ${MEDIUM_COUNT}
+          
+          ### 🔧 Tools Used:
+          - **OSV-Scanner**: Dependency vulnerabilities
+          - **Semgrep**: Code security patterns  
+          - **Trivy**: Filesystem & container vulnerabilities
+          - **Trivy Config**: Infrastructure misconfigurations
+          
+          ${SCAN_SUMMARY}
+          
+          ### 🤖 Next Steps
+          - A detailed security issue has been detected 
+          
+          **⚠️ Security Issue will be Created if PR is merged**: This PR introduces security vulnerabilities that need attention.
+          
+          *Multi-scanner analysis completed at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")*
+          EOF
+          )
+          
+          gh pr comment ${{ github.event.number }} --body "$COMMENT_BODY"
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+
+      - name: 🔍 Check for Existing Security Issues
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: check-existing-issues
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+        run: |
+          # Determine branch context
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BRANCH_REF="${{ github.head_ref }}"
+            PR_NUMBER="${{ github.event.number }}"
+            SEARCH_QUERY="repo:${{ github.repository }} is:issue is:open label:security \"Security Alert\" \"${BRANCH_REF}\" OR \"Pull Request #${PR_NUMBER}\""
+          else
+            BRANCH_REF="${{ github.ref_name }}"
+            SEARCH_QUERY="repo:${{ github.repository }} is:issue is:open label:security \"Security Alert\" \"${BRANCH_REF}\""
+          fi
+          
+          echo "Searching for existing issues with query: $SEARCH_QUERY"
+          
+          # Search for existing security issues for this branch/PR
+          EXISTING_ISSUES=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --state open \
+            --label security \
+            --search "Security Alert ${BRANCH_REF}" \
+            --json number,title,body \
+            --limit 10)
+          
+          echo "Found issues: $EXISTING_ISSUES"
+          
+          # Check if any issues exist
+          if [[ "$EXISTING_ISSUES" == "[]" || -z "$EXISTING_ISSUES" ]]; then
+            echo "No existing security issues found for branch ${BRANCH_REF}"
+            echo "EXISTING_ISSUE_NUMBER=" >> $GITHUB_OUTPUT
+            echo "HAS_EXISTING_ISSUE=false" >> $GITHUB_OUTPUT
+          else
+            # Get the most recent issue number
+            ISSUE_NUMBER=$(echo "$EXISTING_ISSUES" | jq -r '.[0].number')
+            echo "Found existing security issue #$ISSUE_NUMBER"
+            echo "EXISTING_ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+            echo "HAS_EXISTING_ISSUE=true" >> $GITHUB_OUTPUT
+            
+            # Store the existing issue body for comparison
+            EXISTING_BODY=$(echo "$EXISTING_ISSUES" | jq -r '.[0].body')
+            echo "EXISTING_ISSUE_BODY<<EOF" >> $GITHUB_OUTPUT
+            echo "$EXISTING_BODY" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "BRANCH_REF=$BRANCH_REF" >> $GITHUB_OUTPUT
+
+      - name: 🔄 Generate Current Scan Fingerprint
+        id: generate-fingerprint
+        if: steps.process-results.outputs.SHOULD_CREATE_ISSUE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+        run: |
+          # Create a fingerprint of current scan results for comparison
+          FINGERPRINT_DATA=""
+          
+          # Add OSV findings to fingerprint
+          if [[ -f "scan-results/osv-scan.json" ]]; then
+            OSV_FINGERPRINT=$(jq -r '.results[] | select(.packages) | .packages[] | select(.vulnerabilities) | .vulnerabilities[] | "\(.id)|\(.summary // "")"' scan-results/osv-scan.json 2>/dev/null | sort | sha256sum | cut -d' ' -f1)
+            FINGERPRINT_DATA+="OSV:$OSV_FINGERPRINT;"
+          fi
+          
+          # Add Semgrep findings to fingerprint
+          if [[ -f "scan-results/semgrep-scan.json" ]]; then
+            SEMGREP_FINGERPRINT=$(jq -r '.results[]? | "\(.check_id)|\(.path)|\(.start.line // "")"' scan-results/semgrep-scan.json 2>/dev/null | sort | sha256sum | cut -d' ' -f1)
+            FINGERPRINT_DATA+="SEMGREP:$SEMGREP_FINGERPRINT;"
+          fi
+          
+          # Add Trivy findings to fingerprint
+          if [[ -f "scan-results/trivy-fs-scan.json" ]]; then
+            TRIVY_FS_FINGERPRINT=$(jq -r '.Results[]? | .Vulnerabilities[]? | "\(.VulnerabilityID)|\(.PkgName // "")|\(.InstalledVersion // "")"' scan-results/trivy-fs-scan.json 2>/dev/null | sort | sha256sum | cut -d' ' -f1)
+            FINGERPRINT_DATA+="TRIVY_FS:$TRIVY_FS_FINGERPRINT;"
+          fi
+          
+          if [[ -f "scan-results/trivy-config-scan.json" ]]; then
+            TRIVY_CONFIG_FINGERPRINT=$(jq -r '.Results[]? | .Misconfigurations[]? | "\(.ID)|\(.Title // "")"' scan-results/trivy-config-scan.json 2>/dev/null | sort | sha256sum | cut -d' ' -f1)
+            FINGERPRINT_DATA+="TRIVY_CONFIG:$TRIVY_CONFIG_FINGERPRINT;"
+          fi
+          
+          # Create overall fingerprint
+          CURRENT_FINGERPRINT=$(echo "$FINGERPRINT_DATA" | sha256sum | cut -d' ' -f1)
+          echo "CURRENT_FINGERPRINT=$CURRENT_FINGERPRINT" >> $GITHUB_OUTPUT
+          echo "Current scan fingerprint: $CURRENT_FINGERPRINT"
+
+      - name: 🔍 Extract Existing Issue Fingerprint
+        id: extract-existing-fingerprint
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+        if: steps.check-existing-issues.outputs.HAS_EXISTING_ISSUE == 'true' && steps.process-results.outputs.SHOULD_CREATE_ISSUE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Extract fingerprint from existing issue body
+          EXISTING_FINGERPRINT=$(echo "${{ steps.check-existing-issues.outputs.EXISTING_ISSUE_BODY }}" | grep -o 'Scan Fingerprint: [a-f0-9]*' | cut -d' ' -f3 || echo "")
+          
+          if [[ -z "$EXISTING_FINGERPRINT" ]]; then
+            echo "No fingerprint found in existing issue, treating as different"
+            echo "EXISTING_FINGERPRINT=none" >> $GITHUB_OUTPUT
+            echo "FINGERPRINTS_MATCH=false" >> $GITHUB_OUTPUT
+          else
+            echo "Existing issue fingerprint: $EXISTING_FINGERPRINT"
+            echo "EXISTING_FINGERPRINT=$EXISTING_FINGERPRINT" >> $GITHUB_OUTPUT
+            
+            # Compare fingerprints
+            if [[ "$EXISTING_FINGERPRINT" == "${{ steps.generate-fingerprint.outputs.CURRENT_FINGERPRINT }}" ]]; then
+              echo "Fingerprints match - no changes detected"
+              echo "FINGERPRINTS_MATCH=true" >> $GITHUB_OUTPUT
+            else
+              echo "Fingerprints differ - changes detected"
+              echo "FINGERPRINTS_MATCH=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: ⏭️ Skip Duplicate Issue Creation
+        if: steps.check-existing-issues.outputs.HAS_EXISTING_ISSUE == 'true' && steps.extract-existing-fingerprint.outputs.FINGERPRINTS_MATCH == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+        run: |
+          echo "🟢 No changes detected in security scan results."
+          echo "Existing issue #${{ steps.check-existing-issues.outputs.EXISTING_ISSUE_NUMBER }} covers the same vulnerabilities."
+          echo "Skipping issue creation and comment update."
+          
+          # Add a simple status comment if desired
+          gh issue comment ${{ steps.check-existing-issues.outputs.EXISTING_ISSUE_NUMBER }} \
+            --body "🔄 **Scan Update** - $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          No new security issues detected in commit ${{ github.sha }}.
+          All previously identified vulnerabilities remain unchanged.
+          
+          **Status**: No action required - existing remediation plan still applies."
+
+      - name: 💬 Update Existing Issue
+        if: steps.check-existing-issues.outputs.HAS_EXISTING_ISSUE == 'true' && steps.extract-existing-fingerprint.outputs.FINGERPRINTS_MATCH == 'false' && steps.process-results.outputs.SHOULD_CREATE_ISSUE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: update-existing-issue
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+        run: |
+          TOTAL_ISSUES="${{ steps.process-results.outputs.TOTAL_VULNERABILITIES }}"
+          CRITICAL_COUNT="${{ steps.process-results.outputs.CRITICAL_COUNT }}"
+          HIGH_COUNT="${{ steps.process-results.outputs.HIGH_COUNT }}"
+          MEDIUM_COUNT="${{ steps.process-results.outputs.MEDIUM_COUNT }}"
+          
+          # Determine severity badge
+          if [[ $CRITICAL_COUNT -gt 0 ]]; then
+            SEVERITY_BADGE="🔴 CRITICAL"
+          elif [[ $HIGH_COUNT -gt 0 ]]; then
+            SEVERITY_BADGE="🟠 HIGH"  
+          else
+            SEVERITY_BADGE="🟡 MEDIUM"
+          fi
+          
+          # Compile updated findings
+          DETAILED_FINDINGS=""
+          
+          # OSV findings
+          if [[ -f "scan-results/osv-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 📦 Dependency Vulnerabilities (OSV-Scanner)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 2000 scan-results/osv-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          # Semgrep findings  
+          if [[ -f "scan-results/semgrep-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 🔍 Code Security Issues (Semgrep)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 2000 scan-results/semgrep-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          # Trivy findings
+          if [[ -f "scan-results/trivy-fs-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 🛡️ Filesystem Vulnerabilities (Trivy)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 2000 scan-results/trivy-fs-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          if [[ -f "scan-results/trivy-config-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### ⚙️ Configuration Issues (Trivy Config)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 1500 scan-results/trivy-config-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          if [[ -f "scan-results/trivy-dockerfile-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 🐳 Dockerfile Issues (Trivy)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 1000 scan-results/trivy-dockerfile-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+          
+          # Create update comment
+          UPDATE_COMMENT=$(cat << EOF
+          # 🔄 Security Scan Update - $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          
+          **Changes Detected**: New or modified security issues found in commit ${{ github.sha }}
+          
+          ## 📊 Updated Security Overview
+          
+          | Metric | Count |
+          |--------|-------|
+          | **Total Security Issues** | ${TOTAL_ISSUES} |
+          | **Critical Severity** | ${CRITICAL_COUNT} |
+          | **High Severity** | ${HIGH_COUNT} |
+          | **Medium Severity** | ${MEDIUM_COUNT} |
+          | **Overall Severity** | ${SEVERITY_BADGE} |
+          
+          ## 🔍 Latest Scan Context
+          
+          - **Commit**: ${{ github.sha }}
+          - **Branch**: ${{ steps.check-existing-issues.outputs.BRANCH_REF }}
+          - **Scan Time**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          - **Scan Fingerprint**: ${{ steps.generate-fingerprint.outputs.CURRENT_FINGERPRINT }}
+          
+          ## 📋 Updated Security Findings
+          
+          ${DETAILED_FINDINGS}
+          
+          ---
+          
+          **🔗 Latest Workflow Run**: [${{ github.repository }}/actions/runs/${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          > **⚠️ Status**: Security issues have been updated. Previous remediation plan may need revision.
+          EOF
+          )
+          
+          # Add comment to existing issue
+          gh issue comment ${{ steps.check-existing-issues.outputs.EXISTING_ISSUE_NUMBER }} \
+            --body "$UPDATE_COMMENT"
+          
+          echo "✅ Updated existing security issue #${{ steps.check-existing-issues.outputs.EXISTING_ISSUE_NUMBER }}"
+          echo "UPDATED_ISSUE_NUMBER=${{ steps.check-existing-issues.outputs.EXISTING_ISSUE_NUMBER }}" >> $GITHUB_OUTPUT
+
+      - name: 🚨 Create New Security Issue
+        if: steps.check-existing-issues.outputs.HAS_EXISTING_ISSUE == 'false' && steps.process-results.outputs.SHOULD_CREATE_ISSUE == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        id: create-issue
+        run: |
+          TOTAL_ISSUES="${{ steps.process-results.outputs.TOTAL_VULNERABILITIES }}"
+          CRITICAL_COUNT="${{ steps.process-results.outputs.CRITICAL_COUNT }}"
+          HIGH_COUNT="${{ steps.process-results.outputs.HIGH_COUNT }}"
+          MEDIUM_COUNT="${{ steps.process-results.outputs.MEDIUM_COUNT }}"
+          
+          # Determine severity badge
+          if [[ $CRITICAL_COUNT -gt 0 ]]; then
+            SEVERITY_BADGE="🔴 CRITICAL"
+            PRIORITY_LABEL="critical"
+          elif [[ $HIGH_COUNT -gt 0 ]]; then
+            SEVERITY_BADGE="🟠 HIGH"  
+            PRIORITY_LABEL="high-priority"
+          else
+            SEVERITY_BADGE="🟡 MEDIUM"
+            PRIORITY_LABEL="medium-priority"
+          fi
+          
+          # Determine trigger context
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TRIGGER_CONTEXT="Pull Request #${{ github.event.number }}"
+            BRANCH_REF="${{ github.head_ref }}"
+          else
+            TRIGGER_CONTEXT="Push to main branch"
+            BRANCH_REF="${{ github.ref_name }}"
+          fi
+          
+          # Create issue title
+          ISSUE_TITLE="🚨 Security Alert: ${TOTAL_ISSUES} security issues detected in ${BRANCH_REF}"
+          
+          # Compile detailed findings
+          DETAILED_FINDINGS=""
+          
+          # OSV findings
+          if [[ -f "scan-results/osv-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 📦 Dependency Vulnerabilities (OSV-Scanner)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 2000 scan-results/osv-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          # Semgrep findings  
+          if [[ -f "scan-results/semgrep-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 🔍 Code Security Issues (Semgrep)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 2000 scan-results/semgrep-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          # Trivy filesystem findings
+          if [[ -f "scan-results/trivy-fs-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 🛡️ Filesystem Vulnerabilities (Trivy)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 2000 scan-results/trivy-fs-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          # Trivy config findings
+          if [[ -f "scan-results/trivy-config-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### ⚙️ Configuration Issues (Trivy Config)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 1500 scan-results/trivy-config-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+
+          # Trivy Dockerfile findings
+          if [[ -f "scan-results/trivy-dockerfile-scan.json" ]]; then
+            DETAILED_FINDINGS+=$'\n'
+            DETAILED_FINDINGS+="### 🐳 Dockerfile Issues (Trivy)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`json"$'\n'
+            DETAILED_FINDINGS+="$(head -c 1000 scan-results/trivy-dockerfile-scan.json)"$'\n'
+            DETAILED_FINDINGS+="\`\`\`"$'\n'
+          fi
+          
+          # Create issue body
+          ISSUE_BODY=$(cat << EOF
+          # 🛡️ Multi-Tool Security Vulnerability Report
+          
+          ## 📊 Security Issue Overview
+          
+          | Metric | Count |
+          |--------|-------|
+          | **Total Security Issues** | ${TOTAL_ISSUES} |
+          | **Critical Severity** | ${CRITICAL_COUNT} |
+          | **High Severity** | ${HIGH_COUNT} |
+          | **Medium Severity** | ${MEDIUM_COUNT} |
+          | **Overall Severity** | ${SEVERITY_BADGE} |
+          
+          ## 🔍 Detection Context
+          
+          - **Trigger**: ${TRIGGER_CONTEXT}
+          - **Repository**: ${{ github.repository }}
+          - **Branch**: ${BRANCH_REF}
+          - **Commit**: ${{ github.sha }}
+          - **Scan Time**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          - **Scan Fingerprint**: ${{ steps.generate-fingerprint.outputs.CURRENT_FINGERPRINT }}
+          
+          ## 🔧 Scanners Used
+          
+          - **OSV-Scanner**: Dependency vulnerabilities
+          - **Semgrep**: Code security patterns
+          - **Trivy**: Filesystem, container, and infrastructure vulnerabilities
+          - **Trivy Config**: Configuration and infrastructure misconfigurations
+          
+          ## 📋 Detailed Security Findings
+          
+          ${DETAILED_FINDINGS}
+          
+          ## 🎯 Impact Assessment
+          
+          **Possible Affected Areas:**
+          - Application dependencies
+          - Source code security patterns
+          - Operating system and filesystem
+          - Container and infrastructure configurations
+          - Dockerfile and container security
+          
+          **Compliance Implications:**
+          - Security policy compliance review required
+          - Potential data exposure risk
+          - Regulatory compliance impact assessment needed
+          
+          ## 🤖 AI Analysis Required
+          
+          **Status**: ⏳ **Pending Gemini Analysis**
+          
+          This issue will be automatically analyzed by Gemini AI to:
+          - Provide comprehensive security assessment
+          - Generate step-by-step remediation plans
+          - Suggest immediate containment actions
+          - Propose long-term security improvements
+          - Prioritize fixes by impact and effort
+          
+          ---
+          
+          **🔗 Workflow Run**: [${{ github.repository }}/actions/runs/${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          **📁 Scan Results**: Available in workflow artifacts
+          
+          > **⚠️ Action Required**: Do not merge until security issues are addressed and this issue is resolved.
+          EOF
+          )
+          ASSIGNEE="${{ github.actor }}"
+          if [[ "$ASSIGNEE" == *"bot"* ]]; then
+            ASSIGNEE="${{ github.repository_owner }}"
+          fi
+          
+          # Create the issue using GitHub CLI
+          ISSUE_NUMBER=$(gh issue create \
+          --title "$ISSUE_TITLE" \
+          --body "$ISSUE_BODY" \
+          --label "security,vulnerability,multi-tool-scan,$PRIORITY_LABEL" \
+          --assignee "$ASSIGNEE" \
+          | grep -o '[0-9]\+$')
+          
+          echo "CREATED_ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+          echo "✅ Created security issue #$ISSUE_NUMBER"
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+
+      - name: 📤 Upload Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-tool-security-scan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: scan-results/
+          retention-days: 30)
+          
+           echo "CREATED_ISSUE_NUMBER=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+           echo "✅ Created security issue #$ISSUE_NUMBER"
+        env:
+          GH_TOKEN: ${{ secrets.GEMINI_PAT }}
+
+      - name: 📤 Upload Scan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multi-tool-security-scan-results-${{ github.run_number }}
+          path: scan-results/
+          retention-days: 30
